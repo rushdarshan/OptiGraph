@@ -1,73 +1,192 @@
 
-import { D4C } from "d4c-queue";
+/**
+ * OptiGraph PyOdide Helper - Web Worker Integration
+ * Prevents UI freezing during ML computation
+ */
 
-declare var loadPyodide: any;
-declare var pyodide: any;
-declare var globalThis: any;
-declare var self: any;
-
-function baseURL() {
-    const regex = /chrome-extension:\/\/.*(?=\/index.html)/;
-    const matchExtensionURL = window.location.href.match(regex)
-    if (matchExtensionURL) {
-        return matchExtensionURL[0] + "/"
-    }
-    return window.location.origin + window.location.pathname
+interface MLResult {
+    points: number[][];
+    labels: number[];
+    centroids: number[][];
+    inertia: number;
+    inertia_history: number[];
+    explained_variance_ratio: number[];
+    cumulative_variance: number[];
+    n_samples: number;
+    n_features_original: number;
+    n_components: number;
+    n_clusters: number;
+    runtime_ms: number;
 }
 
-const d4c = new D4C();
+class OptiGraphMLWorker {
+    private worker: Worker | null = null;
+    private messageId = 0;
+    private pendingMessages = new Map<number, { resolve: Function; reject: Function }>();
+    private initialized = false;
 
-const initPyodideAndLoadPackages = d4c.wrap(async () => {
-    console.log("OptiGraph: Initializing Pyodide...");
-    
-    globalThis.pyodide = await loadPyodide({ indexURL: baseURL() + "pyodide/" });
-    
-    const pythonCode = await (await fetch('python/pyodide_init.py')).text();
-    await pyodide.loadPackagesFromImports(pythonCode);
-    await pyodide.runPythonAsync(pythonCode);
-    
-    console.log("OptiGraph: Pyodide initialized successfully");
-});
+    constructor() {
+        this.initWorker();
+    }
 
-const loadMLPipeline = d4c.wrap(async () => {
-    console.log("OptiGraph: Loading ML pipeline...");
-    
-    const pythonCode = await (await fetch('python/ml_pipeline.py')).text();
-    await pyodide.loadPackagesFromImports(pythonCode);
-    await pyodide.runPythonAsync(pythonCode);
-    
-    const OptiGraphEngine = pyodide.globals.get('OptiGraphEngine');
-    console.log("OptiGraph: ML pipeline loaded successfully");
-    
-    return OptiGraphEngine;
-});
+    private initWorker() {
+        if (typeof Worker === 'undefined') {
+            console.warn("Web Workers not supported, falling back to main thread");
+            return;
+        }
 
-const runMLPipeline = d4c.wrap(async (
+        try {
+            this.worker = new Worker('./ml-worker.js');
+            
+            this.worker.onmessage = (e) => {
+                const { type, id, payload } = e.data;
+                
+                if (type === 'error') {
+                    console.error("Worker error:", payload.error);
+                    return;
+                }
+                
+                const pendingMessage = this.pendingMessages.get(id);
+                if (pendingMessage) {
+                    this.pendingMessages.delete(id);
+                    
+                    if (payload.success) {
+                        pendingMessage.resolve(payload);
+                    } else {
+                        pendingMessage.reject(new Error(payload.error));
+                    }
+                }
+            };
+            
+            this.worker.onerror = (error) => {
+                console.error("Worker error:", error);
+                this.rejectAllPending(new Error("Worker crashed"));
+            };
+            
+            console.log("OptiGraph: ML Worker created successfully");
+        } catch (error) {
+            console.error("Failed to create ML Worker:", error);
+            this.worker = null;
+        }
+    }
+
+    private sendMessage(type: string, payload: any): Promise<any> {
+        return new Promise((resolve, reject) => {
+            if (!this.worker) {
+                reject(new Error("Worker not available"));
+                return;
+            }
+
+            const id = ++this.messageId;
+            this.pendingMessages.set(id, { resolve, reject });
+
+            this.worker.postMessage({ type, id, payload });
+
+            // Timeout after 60 seconds
+            setTimeout(() => {
+                if (this.pendingMessages.has(id)) {
+                    this.pendingMessages.delete(id);
+                    reject(new Error(`Worker timeout for message type: ${type}`));
+                }
+            }, 60000);
+        });
+    }
+
+    private rejectAllPending(error: Error) {
+        for (const [id, { reject }] of this.pendingMessages) {
+            reject(error);
+        }
+        this.pendingMessages.clear();
+    }
+
+    async initialize(): Promise<void> {
+        if (this.initialized) {
+            return;
+        }
+
+        if (!this.worker) {
+            throw new Error("Web Worker not available. Cannot initialize ML engine.");
+        }
+
+        console.log("OptiGraph: Initializing ML engine in worker...");
+        const result = await this.sendMessage('init', {});
+        
+        if (!result.success) {
+            throw new Error(`ML initialization failed: ${result.error}`);
+        }
+
+        this.initialized = true;
+        console.log("OptiGraph: ML engine initialized successfully");
+    }
+
+    async runPipeline(
+        data: number[][],
+        nComponents: number = 2,
+        nClusters: number = 8
+    ): Promise<MLResult> {
+        if (!this.initialized) {
+            throw new Error("ML engine not initialized. Call initialize() first.");
+        }
+
+        if (!this.worker) {
+            throw new Error("Worker not available");
+        }
+
+        console.log(`OptiGraph: Running pipeline with ${data.length} samples...`);
+        
+        const result = await this.sendMessage('run_pipeline', {
+            data,
+            nComponents,
+            nClusters
+        });
+
+        if (!result.success) {
+            throw new Error(`Pipeline failed: ${result.error}`);
+        }
+
+        return result.data;
+    }
+
+    dispose() {
+        if (this.worker) {
+            this.rejectAllPending(new Error("Worker disposed"));
+            this.worker.terminate();
+            this.worker = null;
+        }
+        this.initialized = false;
+    }
+}
+
+// Singleton instance
+let mlWorker: OptiGraphMLWorker | null = null;
+
+export const initPyodideAndLoadPackages = async (): Promise<void> => {
+    if (!mlWorker) {
+        mlWorker = new OptiGraphMLWorker();
+    }
+    await mlWorker.initialize();
+};
+
+export const loadMLPipeline = async (): Promise<void> => {
+    // Pipeline is loaded as part of initialization
+    return Promise.resolve();
+};
+
+export const runMLPipeline = async (
     data: number[][],
     nComponents: number = 2,
     nClusters: number = 8
-): Promise<any> => {
-    console.log(`OptiGraph: Running pipeline with ${data.length} samples, ${nComponents} components, ${nClusters} clusters`);
+): Promise<MLResult> => {
+    if (!mlWorker) {
+        throw new Error("ML Worker not initialized. Call initPyodideAndLoadPackages() first.");
+    }
     
-    const startTime = performance.now();
-    
-    const OptiGraphEngine = pyodide.globals.get('OptiGraphEngine');
-    const result = OptiGraphEngine.process(data, nComponents, nClusters);
-    const resultJS = result.toJs({ depth: 10 });
-    
-    const endTime = performance.now();
-    const runtime = endTime - startTime;
-    
-    console.log(`OptiGraph: Pipeline completed in ${runtime.toFixed(2)}ms`);
-    
-    return {
-        ...Object.fromEntries(resultJS),
-        runtime_ms: runtime
-    };
-});
+    return mlWorker.runPipeline(data, nComponents, nClusters);
+};
 
-export {
-    initPyodideAndLoadPackages,
-    loadMLPipeline,
-    runMLPipeline
-}
+export const disposePyodide = (): void => {
+    if (mlWorker) {
+        mlWorker.dispose();
+        mlWorker = null;
+    }
+};

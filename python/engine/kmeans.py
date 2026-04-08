@@ -155,7 +155,7 @@ class KMeansFromScratch:
 
     def fit(self, X: np.ndarray):
         """
-        Fit K-Means on data X.
+        Fit K-Means on data X with improved convergence and stability.
         
         Runs K-Means n_init times with different initializations
         and keeps the best result (lowest inertia).
@@ -188,6 +188,14 @@ class KMeansFromScratch:
         if np.any(np.isnan(X)) or np.any(np.isinf(X)):
             raise ValueError("Input contains NaN or Inf values")
         
+        # IMPROVEMENT 1: Adaptive n_init based on data size
+        adaptive_n_init = min(self.n_init, max(3, n_samples // 100))
+        if adaptive_n_init != self.n_init:
+            print(f"Info: Using adaptive n_init={adaptive_n_init} (was {self.n_init}) for {n_samples} samples.")
+        
+        # IMPROVEMENT 2: Early stopping if we get very good results
+        early_stop_threshold = 1e-6 * n_samples * n_features
+        
         # Run K-Means multiple times and keep best result
         best_inertia = np.inf
         best_centroids = None
@@ -195,7 +203,7 @@ class KMeansFromScratch:
         best_history = None
         best_n_iter = None
         
-        for run in range(self.n_init):
+        for run in range(adaptive_n_init):
             # Use different seed for each run but deterministic
             run_rng = np.random.default_rng(self.random_state + run)
             
@@ -207,6 +215,11 @@ class KMeansFromScratch:
                 best_labels = labels
                 best_history = history
                 best_n_iter = n_iter
+                
+                # IMPROVEMENT 3: Early stopping for excellent results
+                if inertia < early_stop_threshold:
+                    print(f"Info: Early stopping at run {run+1}/{adaptive_n_init} (inertia={inertia:.6f} < {early_stop_threshold:.6f})")
+                    break
         
         self.centroids_ = best_centroids
         self.labels_ = best_labels

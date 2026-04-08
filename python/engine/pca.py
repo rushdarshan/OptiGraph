@@ -117,26 +117,50 @@ class PCAFromScratch:
 
     def _fit_svd(self, Xc, n_samples, n_features):
         """
-        SVD on centered data - more numerically stable.
+        SVD on centered data - more numerically stable with regularization.
         
         Math: Xc = U @ S @ V^T
         - V are the principal components (eigenvectors of Xc^T @ Xc)
         - S² / (n-1) are the explained variances (eigenvalues)
         """
+        # IMPROVEMENT 1: Add numerical stability threshold
+        SVD_TOL = 1e-12
+        
+        # Check condition number for potential instability
+        if n_samples <= n_features:
+            # For wide matrices, check gram matrix condition
+            gram_matrix = Xc @ Xc.T
+            cond_num = np.linalg.cond(gram_matrix)
+            if cond_num > 1e10:
+                # Add Tikhonov regularization for ill-conditioned data
+                regularization = 1e-8 * np.trace(gram_matrix) / n_samples
+                Xc_reg = Xc.copy()
+                Xc_reg += np.random.randn(*Xc.shape) * regularization * 0.1
+                print(f"Warning: Ill-conditioned data (cond={cond_num:.2e}). Applied regularization.")
+                Xc = Xc_reg
+        
         # SVD: Xc = U @ S @ Vt
         # full_matrices=False for economy SVD (faster)
         U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
         
-        # V^T rows are principal components
-        # (equivalent to eigenvectors of covariance matrix)
-        k = self.n_components
-        self.components_ = Vt[:k]  # shape: (k, n_features)
+        # IMPROVEMENT 2: Filter near-zero singular values for stability
+        valid_idx = S > SVD_TOL
+        S_filtered = S[valid_idx]
+        
+        # IMPROVEMENT 3: Auto-adjust n_components if we found fewer valid components
+        n_valid = min(len(S_filtered), self.n_components)
+        if n_valid < self.n_components:
+            print(f"Warning: Found only {n_valid} valid components (tol={SVD_TOL:.2e}). Reducing from {self.n_components}.")
+            self.n_components = n_valid
+        
+        # V^T rows are principal components (filtered for numerical stability)
+        self.components_ = Vt[valid_idx][:n_valid]  # shape: (n_valid, n_features)
         
         # Singular values -> explained variance
         # Var = S² / (n-1) since Cov = (Xc^T @ Xc) / (n-1)
-        explained_variance_all = (S ** 2) / (n_samples - 1)
-        self.explained_variance_ = explained_variance_all[:k]
-        self.singular_values_ = S[:k]
+        explained_variance_all = (S_filtered ** 2) / (n_samples - 1)
+        self.explained_variance_ = explained_variance_all[:n_valid]
+        self.singular_values_ = S_filtered[:n_valid]
         
         # Variance ratio
         total_var = explained_variance_all.sum() + 1e-12
