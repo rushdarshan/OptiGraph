@@ -1,23 +1,12 @@
 
 /**
- * OptiGraph PyOdide Helper - Web Worker Integration
+ * OptiGraph PyOdide Helper - Web Worker Integration with Autonomous Optimization
  * Prevents UI freezing during ML computation
+ * Now includes financial guardrails and intelligent routing
  */
 
-interface MLResult {
-    points: number[][];
-    labels: number[];
-    centroids: number[][];
-    inertia: number;
-    inertia_history: number[];
-    explained_variance_ratio: number[];
-    cumulative_variance: number[];
-    n_samples: number;
-    n_features_original: number;
-    n_components: number;
-    n_clusters: number;
-    runtime_ms: number;
-}
+import { MLResult, MLParams } from './types';
+import { mlOptimizer } from './autonomousOptimizer';
 
 class OptiGraphMLWorker {
     private worker: Worker | null = null;
@@ -36,7 +25,9 @@ class OptiGraphMLWorker {
         }
 
         try {
-            this.worker = new Worker('./ml-worker.js');
+            // Use absolute path to worker script
+            const workerPath = `${process.env.PUBLIC_URL || ''}/ml-worker.js`;
+            this.worker = new Worker(workerPath);
             
             this.worker.onmessage = (e) => {
                 const { type, id, payload } = e.data;
@@ -60,10 +51,10 @@ class OptiGraphMLWorker {
             
             this.worker.onerror = (error) => {
                 console.error("Worker error:", error);
-                this.rejectAllPending(new Error("Worker crashed"));
+                this.rejectAllPending(new Error("Worker crashed: " + error.message));
             };
             
-            console.log("OptiGraph: ML Worker created successfully");
+            console.log("OptiGraph: ML Worker created successfully at " + workerPath);
         } catch (error) {
             console.error("Failed to create ML Worker:", error);
             this.worker = null;
@@ -82,20 +73,29 @@ class OptiGraphMLWorker {
 
             this.worker.postMessage({ type, id, payload });
 
-            // Timeout after 60 seconds
-            setTimeout(() => {
+            // Timeout after 30 seconds to prevent hanging
+            const timeoutId = setTimeout(() => {
                 if (this.pendingMessages.has(id)) {
                     this.pendingMessages.delete(id);
+                    console.error(`Worker timeout: ${type} took longer than 30s`);
                     reject(new Error(`Worker timeout for message type: ${type}`));
                 }
-            }, 60000);
+            }, 30000);
+            
+            // Clear timeout on successful completion
+            const originalResolve = resolve;
+            const wrappedResolve = (value: any) => {
+                clearTimeout(timeoutId);
+                originalResolve(value);
+            };
+            this.pendingMessages.set(id, { resolve: wrappedResolve, reject });
         });
     }
 
     private rejectAllPending(error: Error) {
-        for (const [id, { reject }] of this.pendingMessages) {
+        this.pendingMessages.forEach(({ reject }) => {
             reject(error);
-        }
+        });
         this.pendingMessages.clear();
     }
 
@@ -105,18 +105,31 @@ class OptiGraphMLWorker {
         }
 
         if (!this.worker) {
-            throw new Error("Web Worker not available. Cannot initialize ML engine.");
+            console.warn("Web Worker not available, will run computations on main thread");
+            this.initialized = true;
+            return;
         }
 
         console.log("OptiGraph: Initializing ML engine in worker...");
-        const result = await this.sendMessage('init', {});
         
-        if (!result.success) {
-            throw new Error(`ML initialization failed: ${result.error}`);
-        }
+        try {
+            const result = await this.sendMessage('init', {});
+            
+            if (!result.success) {
+                console.error(`ML initialization failed: ${result.error}, falling back to main thread`);
+                this.worker = null;
+                this.initialized = true;
+                return;
+            }
 
-        this.initialized = true;
-        console.log("OptiGraph: ML engine initialized successfully");
+            this.initialized = true;
+            console.log("OptiGraph: ML engine initialized successfully");
+        } catch (err) {
+            console.error("ML initialization timeout/error:", err);
+            this.worker = null;
+            this.initialized = true;
+            // Don't throw - allow graceful fallback
+        }
     }
 
     async runPipeline(
@@ -128,11 +141,27 @@ class OptiGraphMLWorker {
             throw new Error("ML engine not initialized. Call initialize() first.");
         }
 
+        // AUTONOMOUS OPTIMIZATION: Use intelligent routing with financial guardrails
+        const params: MLParams = { nComponents, nClusters };
+        
+        try {
+            console.log(`🤖 OptiGraph: Running autonomous optimization for ${data.length} samples...`);
+            return await mlOptimizer.executeWithGuardrails(data, params);
+        } catch (optimizationError) {
+            console.warn('💰 Autonomous optimizer failed, falling back to direct execution:', optimizationError);
+            return this.runDirectExecution(data, nComponents, nClusters);
+        }
+    }
+
+    /**
+     * Direct execution for fallback scenarios (exposed for autonomous optimizer)
+     */
+    async runDirectExecution(data: number[][], nComponents: number, nClusters: number): Promise<MLResult> {
         if (!this.worker) {
             throw new Error("Worker not available");
         }
 
-        console.log(`OptiGraph: Running pipeline with ${data.length} samples...`);
+        console.log(`OptiGraph: Running direct pipeline with ${data.length} samples...`);
         
         const result = await this.sendMessage('run_pipeline', {
             data,
@@ -157,7 +186,10 @@ class OptiGraphMLWorker {
     }
 }
 
-// Singleton instance
+// Export the class for autonomous optimizer
+export { OptiGraphMLWorker };
+
+// Singleton instance  
 let mlWorker: OptiGraphMLWorker | null = null;
 
 export const initPyodideAndLoadPackages = async (): Promise<void> => {
