@@ -67,3 +67,9 @@ Desktop.ini
 *.tmp
 *.temp
 .cache/
+
+# Generated output and build artifacts
+graphify-out/
+superpowers/
+.agents/
+.benchmarks/
